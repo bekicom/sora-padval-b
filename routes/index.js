@@ -1,5 +1,7 @@
 const express = require("express");
 const router = express.Router();
+
+// Middlewares
 const authMiddleware = require("../middlewares/auth.middleware");
 const upload = require("../middlewares/upload.middleware");
 const { onlyAdmin } = require("../middlewares/role.middleware");
@@ -16,20 +18,24 @@ const printer = require("../controllers/printer.controller");
 const setting = require("../controllers/settings.controller");
 const client = require("../controllers/clientController");
 const payment = require("../controllers/paymentController");
+
 // ===== AUTH =====
 router.post("/auth/login", auth.login);
 router.post("/auth/register", auth.register);
 router.get("/auth/me", authMiddleware, auth.getMe);
+
 // ===== USERS =====
 router.post("/users", authMiddleware, onlyAdmin, user.createUser);
 router.get("/users", user.getAllUsers);
 router.put("/users/:id", authMiddleware, user.updateUser);
 router.delete("/users/:id", authMiddleware, user.deleteUser);
+
 // ===== TABLES =====
 router.post("/tables/create", authMiddleware, table.createTable);
 router.get("/tables/list", authMiddleware, table.getTables);
 router.put("/tables/update/:id", authMiddleware, table.updateTable);
 router.delete("/tables/delete/:id", authMiddleware, table.deleteTable);
+
 // ===== CATEGORIES =====
 router.post("/categories/create", authMiddleware, category.createCategory);
 router.get("/categories/list", authMiddleware, category.getCategories);
@@ -39,11 +45,13 @@ router.delete(
   authMiddleware,
   category.deleteCategory
 );
+
 // ===== FOODS =====
 router.post("/foods/create", authMiddleware, food.createFood);
 router.get("/foods/list", authMiddleware, food.getAllFoods);
 router.put("/foods/update/:id", authMiddleware, food.updateFood);
 router.delete("/foods/delete/:id", authMiddleware, food.deleteFood);
+
 // ===== IMAGE UPLOAD =====
 router.post("/upload", upload.single("image"), (req, res) => {
   if (!req.file) return res.status(400).json({ message: "Rasm yuklanmadi" });
@@ -52,6 +60,7 @@ router.post("/upload", upload.single("image"), (req, res) => {
   }`;
   res.status(200).json({ imageUrl });
 });
+
 // ===== DEPARTMENTS =====
 router.post("/departments/create", authMiddleware, department.createDepartment);
 router.get("/departments/list", authMiddleware, department.getAllDepartments);
@@ -65,7 +74,8 @@ router.delete(
   authMiddleware,
   department.deleteDepartment
 );
-// // ===== ORDERS =====
+
+// ===== ORDERS =====
 router.post("/orders/create", authMiddleware, order.createOrder);
 router.get("/orders/table/:tableId", authMiddleware, order.getOrdersByTable);
 router.put("/orders/status/:orderId", authMiddleware, order.updateOrderStatus);
@@ -79,7 +89,6 @@ router.get(
   authMiddleware,
   order.getPendingPayments
 );
-
 router.post(
   "/orders/kassir-print/:orderId",
   authMiddleware,
@@ -91,14 +100,11 @@ router.post(
   order.processPayment
 );
 router.get("/orders/daily-sales", authMiddleware, order.getDailySalesSummary);
-
-// ✅ YANGI ROUTE — mavjud zakazga qo‘shimcha taom qo‘shish
 router.post(
   "/orders/:orderId/add-items",
   authMiddleware,
   order.addItemsToOrder
 );
-
 router.post(
   "/orders/print-receipt/:orderId",
   authMiddleware,
@@ -109,9 +115,9 @@ router.post(
   authMiddleware,
   order.cancelOrderItem
 );
+router.put("/orders/move-table", authMiddleware, order.moveOrderToAnotherTable);
 
-// ===== PAYMENTS (YANGI QOSHILDI) =====
-
+// ===== PAYMENTS =====
 router.get(
   "/payments/daily-stats",
   authMiddleware,
@@ -127,11 +133,7 @@ router.get(
   authMiddleware,
   payment.getPaymentMethodStats
 );
-
-// 2. GENERIC ROUTES (keyin)
 router.get("/payments", authMiddleware, payment.getAllPayments);
-
-// 3. DYNAMIC ROUTES (eng oxirida)
 router.get("/payments/:paymentId", authMiddleware, payment.getPaymentById);
 
 // ===== PRINTERS =====
@@ -166,7 +168,7 @@ router.post(
   "/settings/upload-logo",
   authMiddleware,
   onlyAdmin,
-  upload.single("logo"), // ✅ Logo upload middleware
+  upload.single("logo"),
   setting.uploadLogo
 );
 router.delete("/settings/logo", authMiddleware, onlyAdmin, setting.deleteLogo);
@@ -182,7 +184,7 @@ router.get(
   setting.generateTestReceipt
 );
 router.get("/settings/info", setting.getSettingsInfo);
-router.get("/settings/public", (req, res) => setting.getSettings(req, res));
+router.get("/settings/public", setting.getSettings);
 router.post(
   "/settings/test-kassir-printer",
   authMiddleware,
@@ -194,8 +196,6 @@ router.get(
   authMiddleware,
   setting.getKassirPrinterStatus
 );
-
-// ✅ HTML to Image Print endpoint
 router.post("/api/print-image", authMiddleware, setting.printImageReceipt);
 
 // Backward compatibility
@@ -225,30 +225,29 @@ router.get(
   client.getClientByCardNumber
 );
 
-// ===== KASSIR DASHBOARD ROUTES =====
-// ✅ Kassir specific routes grouped together
-router.get("/kassir/dashboard", authMiddleware, order.getPendingPayments); // Kassir dashboard
-router.get("/kassir/orders", authMiddleware, order.getCompletedOrders); // Kassir orders list
-router.get("/kassir/sales-summary", authMiddleware, order.getDailySalesSummary); // Sales summary
+// ===== KASSIR DASHBOARD =====
+router.get("/kassir/dashboard", authMiddleware, order.getPendingPayments);
+router.get("/kassir/orders", authMiddleware, order.getCompletedOrders);
+router.get("/kassir/sales-summary", authMiddleware, order.getDailySalesSummary);
 router.post(
   "/kassir/print/:orderId",
   authMiddleware,
   order.printReceiptForKassir
-); // Kassir print
-router.post("/kassir/payment/:orderId", authMiddleware, order.processPayment); // Process payment
+);
+router.post("/kassir/payment/:orderId", authMiddleware, order.processPayment);
 
-// ✅ KASSIR PAYMENT ROUTES (SPECIFIC ROUTES BIRINCHI)
+// ===== KASSIR PAYMENTS =====
 router.get(
   "/kassir/payments/stats",
   authMiddleware,
   payment.getDailyPaymentStats
-); // Kassir statistika
+);
 router.get(
   "/kassir/my-payments",
   authMiddleware,
   payment.getKassirPaymentStats
-); // Kassir shaxsiy statistika
-router.get("/kassir/payments", authMiddleware, payment.getAllPayments); // Kassir uchun to'lovlar
+);
+router.get("/kassir/payments", authMiddleware, payment.getAllPayments);
 
 // ===== HEALTH CHECK =====
 router.get("/health", (req, res) => {
@@ -256,17 +255,17 @@ router.get("/health", (req, res) => {
     success: true,
     message: "API ishlayapti",
     timestamp: new Date().toISOString(),
-    version: "2.1.0", // ✅ Version updated for payment system
+    version: "2.1.0",
     features: {
       kassir_workflow: true,
       html_to_image_print: true,
       payment_processing: true,
-      payment_tracking: true, // ✅ YANGI FEATURE
+      payment_tracking: true,
     },
   });
 });
 
-// ===== DEBUG (DEVELOPMENT ONLY) =====
+// ===== DEBUG =====
 if (process.env.NODE_ENV === "development") {
   router.get("/debug/routes", (req, res) => {
     const routes = [];
@@ -276,11 +275,10 @@ if (process.env.NODE_ENV === "development") {
         routes.push({
           path: middleware.route.path,
           methods,
-          // ✅ Add route categories for debugging
           category: middleware.route.path.includes("/kassir")
             ? "kassir"
             : middleware.route.path.includes("/payments")
-            ? "payments" // ✅ YANGI CATEGORY
+            ? "payments"
             : middleware.route.path.includes("/orders")
             ? "orders"
             : middleware.route.path.includes("/settings")
@@ -290,7 +288,6 @@ if (process.env.NODE_ENV === "development") {
       }
     });
 
-    // ✅ Group routes by category
     const routesByCategory = routes.reduce((acc, route) => {
       const category = route.category;
       if (!acc[category]) acc[category] = [];
@@ -303,26 +300,22 @@ if (process.env.NODE_ENV === "development") {
       total_routes: routes.length,
       routes_by_category: routesByCategory,
       kassir_routes: routes.filter((r) => r.category === "kassir"),
-      payment_routes: routes.filter((r) => r.category === "payments"), // ✅ YANGI
+      payment_routes: routes.filter((r) => r.category === "payments"),
       timestamp: new Date().toISOString(),
     });
   });
 
-  // ✅ Debug kassir workflow status
   router.get("/debug/kassir-status", authMiddleware, async (req, res) => {
     try {
-      const pendingCount = await require("../models/Order").countDocuments({
-        status: "completed",
-      });
-      const paidCount = await require("../models/Order").countDocuments({
-        status: "paid",
-      });
+      const Order = require("../models/Order");
+      const Payment = require("../models/Payment");
 
-      // ✅ PAYMENT STATISTICS
-      const paymentCount = await require("../models/Payment").countDocuments({
+      const pendingCount = await Order.countDocuments({ status: "completed" });
+      const paidCount = await Order.countDocuments({ status: "paid" });
+      const paymentCount = await Payment.countDocuments({
         status: "completed",
       });
-      const todayPayments = await require("../models/Payment").countDocuments({
+      const todayPayments = await Payment.countDocuments({
         status: "completed",
         payment_date: new Date().toISOString().split("T")[0],
       });
@@ -335,7 +328,6 @@ if (process.env.NODE_ENV === "development") {
           total_processed: pendingCount + paidCount,
         },
         payment_system: {
-          // ✅ YANGI
           total_payments: paymentCount,
           today_payments: todayPayments,
         },
@@ -351,4 +343,3 @@ if (process.env.NODE_ENV === "development") {
 }
 
 module.exports = router;
-//

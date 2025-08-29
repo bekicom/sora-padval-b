@@ -7,26 +7,29 @@ const Table = require("../models/Table");
 // ✅ STOL STATUSINI YANGILASH FUNKSIYASI
 const updateTableStatus = async (tableId, status) => {
   try {
-    console.log(`🔄 Stol statusini yangilash: ${tableId} -> ${status}`);
-
     const table = await Table.findByIdAndUpdate(
       tableId,
-      { status: status },
+      { status },
       { new: true }
-    );
+    ).lean();
 
-    if (table) {
-      console.log(`✅ Stol statusi yangilandi: ${table.name} -> ${status}`);
-      return { success: true, table };
-    } else {
-      console.warn(`⚠️ Stol topilmadi: ${tableId}`);
-      return { success: false, error: "Stol topilmadi" };
+    if (!table) {
+      return { success: false, error: `Stol topilmadi: ${tableId}` };
     }
+
+    return {
+      success: true,
+      table,
+      message: `Stol statusi yangilandi: ${table.name} -> ${status}`,
+    };
   } catch (error) {
-    console.error(`❌ Stol statusini yangilashda xatolik:`, error);
-    return { success: false, error: error.message };
+    return {
+      success: false,
+      error: `Stol statusini yangilashda xatolik: ${error.message}`,
+    };
   }
 };
+
 // 🖨️ Print server orqali yuborish
 
 const closeOrder = async (req, res) => {
@@ -334,6 +337,77 @@ const closeOrder = async (req, res) => {
   }
 };
 
+// ✅ Helper: input validation
+const validateOrderInput = ({ table_id, user_id, items, total_price }) => {
+  if (!user_id) throw new Error("Afitsant ID kerak");
+  if (!table_id) throw new Error("Stol ID kerak");
+  if (!items || !Array.isArray(items) || items.length === 0)
+    throw new Error("Kamida bitta taom kerak");
+  if (!total_price || total_price <= 0)
+    throw new Error("To'g'ri narx kiriting");
+};
+
+// ✅ Helper: hisob-kitob
+const calculateTotals = (subtotal, waiterPercentage = 0, taxAmount = 0) => {
+  const serviceAmount =
+    Math.round(subtotal * (waiterPercentage / 100) * 100) / 100;
+  const finalTotal =
+    Math.round((subtotal + serviceAmount + taxAmount) * 100) / 100;
+  return { subtotal, serviceAmount, taxAmount, finalTotal };
+};
+
+// ✅ Helper: taomlarni tekshirish va yangilash
+const processItems = async (items, session) => {
+  const updatedItems = [];
+  let subtotal = 0;
+
+  for (const item of items) {
+    const { food_id, quantity } = item;
+    const parsedQuantity = parseFloat(quantity);
+
+    if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
+      throw new Error(`Noto'g'ri miqdor: ${quantity}`);
+    }
+
+    const food = await Food.findById(food_id)
+      .populate("category")
+      .session(session);
+
+    if (!food || !food.price || food.price <= 0) {
+      throw new Error(
+        `Taom topilmadi yoki narxi noto'g'ri: ${food?.name || food_id}`
+      );
+    }
+
+    if (food.soni < parsedQuantity) {
+      throw new Error(
+        `Yetarli miqdor yo'q. ${food.name} - mavjud: ${food.soni}${
+          food.unit || "dona"
+        }, so'ralgan: ${parsedQuantity}${food.unit || "dona"}`
+      );
+    }
+
+    // Ombordan kamaytirish
+    food.soni = Math.round((food.soni - parsedQuantity) * 1000) / 1000;
+    await food.save({ session });
+
+    const itemTotal = Math.round(food.price * parsedQuantity * 100) / 100;
+    subtotal += itemTotal;
+
+    updatedItems.push({
+      food_id,
+      name: food.name,
+      price: food.price,
+      quantity: parsedQuantity,
+      unit: food.unit || "dona",
+      total: itemTotal,
+      category_name: food.category?.title,
+    });
+  }
+
+  return { updatedItems, subtotal };
+};
+
 const createOrder = async (req, res) => {
   const session = await Food.startSession();
   session.startTransaction();
@@ -343,52 +417,28 @@ const createOrder = async (req, res) => {
     console.log("📝 Yangi zakaz ma'lumotlari:", req.body);
 
     // ✅ Input validation
-    if (!user_id) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: "Afitsant ID kerak" });
-    }
-
-    if (!table_id) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: "Stol ID kerak" });
-    }
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: "Kamida bitta taom kerak" });
-    }
-
-    if (!total_price || total_price <= 0) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: "To'g'ri narx kiriting" });
-    }
+    if (!user_id) throw new Error("Afitsant ID kerak");
+    if (!table_id) throw new Error("Stol ID kerak");
+    if (!items || !Array.isArray(items) || items.length === 0)
+      throw new Error("Kamida bitta taom kerak");
+    if (!total_price || total_price <= 0)
+      throw new Error("To'g'ri narx kiriting");
 
     // Afitsantni tekshirish
     const waiter = await User.findById(user_id).lean();
-    if (!waiter) {
-      await session.abortTransaction();
-      return res.status(404).json({ message: "Afitsant topilmadi" });
-    }
+    if (!waiter) throw new Error("Afitsant topilmadi");
+    if (!waiter.is_active) throw new Error("Afitsant faol emas");
 
-    if (!waiter.is_active) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: "Afitsant faol emas" });
-    }
-
-    const waiterPercentage = waiter?.percent ? Number(waiter.percent) : 0;
-    const serviceAmount =
+    let waiterPercentage = waiter?.percent ? Number(waiter.percent) : 0;
+    let serviceAmount =
       Math.round(total_price * (waiterPercentage / 100) * 100) / 100;
     const taxAmount = 0;
-    const finalTotal =
+    let finalTotal =
       Math.round((total_price + serviceAmount + taxAmount) * 100) / 100;
 
     // Stolni tekshirish
     const table = await Table.findById(table_id).session(session);
-    if (!table) {
-      await session.abortTransaction();
-      return res.status(404).json({ message: "Stol topilmadi" });
-    }
-
+    if (!table) throw new Error("Stol topilmadi");
     const tableNumber = table?.number || table?.name || req.body.table_number;
 
     // Taomlarni tekshirish va miqdorni yangilash
@@ -397,16 +447,10 @@ const createOrder = async (req, res) => {
 
     for (const item of items) {
       const { food_id, quantity } = item;
-
-      // ✅ Quantity ni float qilib parse qilish
       const parsedQuantity = parseFloat(quantity);
 
-      // ✅ Quantity validatsiya (musbat son ekanligini tekshirish)
       if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
-        await session.abortTransaction();
-        return res.status(400).json({
-          message: `Noto'g'ri miqdor: ${quantity}. Musbat son bo'lishi kerak`,
-        });
+        throw new Error(`Noto'g'ri miqdor: ${quantity}`);
       }
 
       const food = await Food.findById(food_id)
@@ -414,29 +458,23 @@ const createOrder = async (req, res) => {
         .session(session);
 
       if (!food || !food.price || food.price <= 0) {
-        await session.abortTransaction();
-        return res.status(400).json({
-          message: `Taom topilmadi yoki narxi noto'g'ri: ${
-            food?.name || food_id
-          }`,
-        });
+        throw new Error(
+          `Taom topilmadi yoki narxi noto'g'ri: ${food?.name || food_id}`
+        );
       }
 
-      // ✅ Kg asosida sotish uchun miqdor tekshirish
       if (food.soni < parsedQuantity) {
-        await session.abortTransaction();
-        return res.status(400).json({
-          message: `Yetarli miqdor yo'q. ${food.name} - mavjud: ${food.soni}${
+        throw new Error(
+          `Yetarli miqdor yo'q. ${food.name} - mavjud: ${food.soni}${
             food.unit || "dona"
-          }, so'ralgan: ${parsedQuantity}${food.unit || "dona"}`,
-        });
+          }, so'ralgan: ${parsedQuantity}${food.unit || "dona"}`
+        );
       }
 
-      // ✅ Miqdorni kamaytirish (decimal/float qiymat bilan)
-      food.soni = Math.round((food.soni - parsedQuantity) * 1000) / 1000; // 3 kasr xonasigacha aniqlik
+      // Miqdorni kamaytirish
+      food.soni = Math.round((food.soni - parsedQuantity) * 1000) / 1000;
       await food.save({ session });
 
-      // ✅ Narxni hisoblash (decimal miqdor bilan)
       const itemTotal = Math.round(food.price * parsedQuantity * 100) / 100;
       calculatedTotal += itemTotal;
 
@@ -444,35 +482,21 @@ const createOrder = async (req, res) => {
         food_id,
         name: food.name,
         price: food.price,
-        quantity: parsedQuantity, // ✅ Float qiymat saqlanadi
-        unit: food.unit || "dona", // ✅ O'lchov birligini qo'shish
+        quantity: parsedQuantity,
+        unit: food.unit || "dona",
         total: itemTotal,
         category_name: food.category?.title,
-        printer_id: food.category?.printer_id,
-        printer_ip: food.category?.printer?.ip,
-        printer_name: food.category?.printer?.name,
       });
     }
 
-    // ✅ Hisoblangan jami narx bilan taqqoslash
+    // ✅ Narxni qayta hisoblash
     const totalDifference = Math.abs(calculatedTotal - total_price);
     if (totalDifference > 0.01) {
-      // 1 tiyin farq bo'lsa ham xato
-      console.warn(
-        `⚠️ Narx farqi: hisoblangan=${calculatedTotal}, yuborilgan=${total_price}`
-      );
-      // Hisoblangan narxni ishlatish
       calculatedTotal = Math.round(calculatedTotal * 100) / 100;
-      const recalculatedServiceAmount =
+      serviceAmount =
         Math.round(calculatedTotal * (waiterPercentage / 100) * 100) / 100;
-      const recalculatedFinalTotal =
-        Math.round(
-          (calculatedTotal + recalculatedServiceAmount + taxAmount) * 100
-        ) / 100;
-
-      // Yangilangan qiymatlarni ishlatish
-      serviceAmount = recalculatedServiceAmount;
-      finalTotal = recalculatedFinalTotal;
+      finalTotal =
+        Math.round((calculatedTotal + serviceAmount + taxAmount) * 100) / 100;
     }
 
     // Buyurtma yaratish
@@ -483,7 +507,7 @@ const createOrder = async (req, res) => {
           user_id,
           items: updatedItems,
           table_number: tableNumber,
-          total_price: calculatedTotal, // ✅ Hisoblangan narxni ishlatish
+          total_price: calculatedTotal,
           status: "pending",
           waiter_name: first_name || `${waiter.first_name} ${waiter.last_name}`,
           waiter_percentage: waiterPercentage,
@@ -501,85 +525,22 @@ const createOrder = async (req, res) => {
     const newOrder = newOrderArr[0];
 
     // Stol statusini yangilash
-    try {
-      await updateTableStatus(table_id, "band");
-    } catch (tableError) {
-      console.error("❌ Stol statusini yangilashda xatolik:", tableError);
-    }
-
-    await session.commitTransaction();
-
-    // Printerga yuborish
-    const printResults = await handlePrinting(
-      printerGroups,
-      tableNumber,
-      waiter,
-      newOrder,
-      calculatedTotal,
-      serviceAmount,
-      finalTotal
+    await updateTableStatus(table_id, "band").catch((e) =>
+      console.error("❌ Stol statusi xatolik:", e)
     );
 
-    // Socket.io orqali real-time yangilanishlar
-    const io = req.app.get("io");
-    if (io) {
-      try {
-        // 1. Yangi buyurtma haqida xabar berish
-        io.emit("new_order", {
-          type: "NEW_ORDER",
-          order: newOrder,
-          table: {
-            id: table_id,
-            number: tableNumber,
-            status: "band",
-          },
-          waiter: {
-            id: user_id,
-            name: first_name || `${waiter.first_name} ${waiter.last_name}`,
-          },
-          timestamp: new Date(),
-        });
+    // ✅ Transactionni yakunlash
+    await session.commitTransaction();
 
-        // 2. Barcha pending buyurtmalarni yangilash
-        const pendingOrders = await Order.find({ status: "pending" })
-          .sort({ createdAt: -1 })
-          .lean();
-
-        io.emit("update_pending_orders", {
-          type: "PENDING_ORDERS_UPDATE",
-          orders: pendingOrders,
-          count: pendingOrders.length,
-          updatedAt: new Date(),
-        });
-
-        // 3. Stol holatini yangilash
-        io.emit("table_status_changed", {
-          type: "TABLE_STATUS",
-          tableId: table_id,
-          status: "band",
-          orderId: newOrder._id,
-          waiterId: user_id,
-        });
-
-        console.log("📢 Socket.io orqali yangilanishlar yuborildi");
-      } catch (socketError) {
-        console.error("❌ Socket.io xatosi:", socketError);
-      }
-    }
-
-    // Javobni yuborish
-    const response = {
+    return res.status(201).json({
       success: true,
       message: "Zakaz muvaffaqiyatli yaratildi",
       order: newOrder,
-      printing: printResults,
-    };
-
-    res.status(201).json(response);
+    });
   } catch (error) {
     await session.abortTransaction();
     console.error("❌ Zakaz yaratishda xatolik:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Zakaz yaratishda xatolik",
       error: error.message,
@@ -588,51 +549,6 @@ const createOrder = async (req, res) => {
     await session.endSession();
   }
 };
-// Printerga yuborish uchun alohida funksiya
-async function handlePrinting(
-  printerGroups,
-  tableNumber,
-  waiter,
-  newOrder,
-  calculatedTotal,
-  serviceAmount,
-  finalTotal
-) {
-  const printResults = [];
-
-  for (const [printerIp, group] of Object.entries(printerGroups)) {
-    const payload = {
-      items: group.items,
-      table_number: tableNumber,
-      waiter_name: waiter.first_name + " " + waiter.last_name,
-      date: new Date().toLocaleString("uz-UZ"),
-      order_id: newOrder._id.toString(),
-      order_number:
-        newOrder.formatted_order_number ||
-        `#${newOrder._id.toString().slice(-6)}`,
-      total_amount: calculatedTotal,
-      service_amount: serviceAmount,
-      final_total: finalTotal,
-    };
-
-    try {
-      const result = await printToPrinter(printerIp, payload);
-      printResults.push({
-        printer_ip: printerIp,
-        success: true,
-        ...result,
-      });
-    } catch (error) {
-      printResults.push({
-        printer_ip: printerIp,
-        success: false,
-        error: error.message,
-      });
-    }
-  }
-
-  return printResults;
-}
 
 const processPayment = async (req, res) => {
   try {
@@ -945,7 +861,6 @@ const processPayment = async (req, res) => {
   }
 };
 
-// ✅ KASSIR UCHUN CHEK CHIQARISH
 const printReceiptForKassir = async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -1458,8 +1373,6 @@ const printReceipt = async (req, res) => {
   return await printReceiptForKassir(req, res);
 };
 
-// buyurtma qoshish
-// ✅ Mavjud orderga qo‘shimcha taomlar qo‘shish
 const addItemsToOrder = async (req, res) => {
   const session = await Order.startSession();
   session.startTransaction();
@@ -1545,13 +1458,9 @@ const addItemsToOrder = async (req, res) => {
           quantity,
           total: itemTotal,
           category_name: food.category?.title,
-          printer_id: food.category?.printer_id,
-          printer_ip: food.category?.printer?.ip,
-          printer_name: food.category?.printer?.name,
         });
       }
 
-      // Printerga yuboriladigan ro‘yxat
       newItems.push({
         name: food.name,
         quantity,
@@ -1570,26 +1479,9 @@ const addItemsToOrder = async (req, res) => {
       order.total_price + serviceAmount + (order.tax_amount || 0);
 
     await order.save({ session });
-
     await session.commitTransaction();
 
-    // ✅ Faqat yangi itemlarni printerga yuborish
-    if (newItems.length > 0) {
-      try {
-        await printToPrinter(order.items[0]?.printer_ip || "192.168.0.106", {
-          items: newItems,
-          table_number: tableNumber,
-          waiter_name: waiter.first_name,
-          date: new Date().toLocaleString("uz-UZ"),
-          order_id: order._id.toString(),
-          order_number: order.formatted_order_number,
-        });
-      } catch (printerError) {
-        console.error("❌ Printerga yuborishda xatolik:", printerError);
-      }
-    }
-
-    // ✅ Socket.io orqali yangilash
+    // ✅ Socket.io orqali yangilash (printer yo‘q)
     const io = req.app.get("io");
     if (io) {
       io.emit("order_items_added", {
@@ -1715,8 +1607,14 @@ const cancelOrderItem = async (req, res) => {
       });
     }
 
-    // ✅ Taomni ombordan topish
-    const food = await Food.findById(food_id).session(session);
+    // ✅ Taomni ombordan topish (kategoriya + printer)
+    const food = await Food.findById(food_id)
+      .populate({
+        path: "category",
+        select: "title printer_id",
+      })
+      .session(session);
+
     if (!food) {
       await session.abortTransaction();
       return res
@@ -1734,7 +1632,7 @@ const cancelOrderItem = async (req, res) => {
 
     // ✅ Itemni yangilash yoki o‘chirish
     if (cancel_quantity === currentQuantity) {
-      order.items.splice(itemIndex, 1); // faqat o‘chiradi
+      order.items.splice(itemIndex, 1);
     } else {
       order.items[itemIndex].quantity -= cancel_quantity;
       order.items[itemIndex].total =
@@ -1759,9 +1657,10 @@ const cancelOrderItem = async (req, res) => {
       cancelled_by: userId,
       cancelled_by_name: userName,
       cancelled_at: new Date(),
+      category_id: food.category?._id || null,
+      category_title: food.category?.title || null,
+      category_printer_id: food.category?.printer_id || null,
     });
-
-    // ❌ Bu joy olib tashlandi: oxirgi item bo‘lsa ham order cancel bo‘lmasin
 
     await order.save({ session });
 
@@ -1769,10 +1668,67 @@ const cancelOrderItem = async (req, res) => {
     food.soni += cancel_quantity;
     await food.save({ session });
 
+    // ⚠️ Printer uchun transactiondan tashqarida ishlaymiz
     await session.commitTransaction();
+    await session.endSession();
+
+    // ---------------------------------------------
+    // 🖨 PRINTERGA YUBORISH
+    // ---------------------------------------------
+    let targetPrinter = null;
+    try {
+      const categoryPrinterId = food.category?.printer_id;
+
+      if (categoryPrinterId) {
+        targetPrinter = await Printer.findById(categoryPrinterId).lean();
+      }
+
+      if (!targetPrinter) {
+        // fallback: Settings dagi default/kitchen/cashier
+        const settings = await Settings.findOne({}).lean();
+        const fallbackPrinterId =
+          settings?.kitchen_printer_id ||
+          settings?.default_printer_id ||
+          settings?.cashier_printer_id;
+
+        if (fallbackPrinterId) {
+          targetPrinter = await Printer.findById(fallbackPrinterId).lean();
+        }
+      }
+
+      if (targetPrinter) {
+        await sendPrintJob({
+          printer: targetPrinter,
+          type: "CANCEL",
+          payload: {
+            orderId: String(order._id),
+            table: order.table_id?.name || order.table_id?.number || "",
+            cancelledBy: userName,
+            item: {
+              name: orderItem.name,
+              qty: cancel_quantity,
+              price: orderItem.price,
+              amount: cancelledAmount,
+            },
+            reason,
+            notes: notes || "",
+            time: new Date().toISOString(),
+          },
+        });
+      } else {
+        console.warn(
+          "! Kategoriya printeri topilmadi (cancel) va fallback yo'q"
+        );
+      }
+    } catch (printErr) {
+      console.error(
+        "Printerga yuborishda xatolik (cancel):",
+        printErr?.message
+      );
+    }
 
     // ✅ Javob
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Taom muvaffaqiyatli atmen qilindi",
       order: {
@@ -1793,6 +1749,9 @@ const cancelOrderItem = async (req, res) => {
         cancelled_amount: cancelledAmount,
         reason,
         notes,
+        category_id: food.category?._id || null,
+        category_title: food.category?.title || null,
+        category_printer_id: food.category?.printer_id || null,
       },
       inventory_update: {
         food_name: food.name,
@@ -1802,14 +1761,151 @@ const cancelOrderItem = async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    await session.abortTransaction();
-    res.status(500).json({
+    try {
+      await session.abortTransaction();
+    } catch (_) {}
+    await session.endSession();
+    return res.status(500).json({
       success: false,
       message: "Taom atmen qilishda xatolik",
       error: error.message,
     });
-  } finally {
+  }
+};
+
+// ✅ ZAKAZNI BOSHQA STOLGA KO‘CHIRISH
+const moveOrderToAnotherTable = async (req, res) => {
+  const session = await Order.startSession();
+  session.startTransaction();
+
+  try {
+    const { orderId, newTableId, force = false } = req.body;
+    const userId = req.user?.id;
+    const userRole = req.user?.role;
+
+    if (!orderId || !newTableId) {
+      throw new Error("orderId va newTableId kerak");
+    }
+
+    // 🔎 Zakazni topish
+    const order = await Order.findById(orderId)
+      .populate("table_id", "name number")
+      .populate("user_id", "first_name last_name")
+      .session(session);
+
+    if (!order) throw new Error("Zakaz topilmadi");
+
+    // 🔒 Ruxsat tekshirish
+    const isOwner =
+      String(order.user_id?._id || order.user_id) === String(userId);
+    const isCashier = userRole === "kassir";
+    if (!isOwner && !isCashier) {
+      throw new Error("Faqat zakaz egasi yoki kassir ko‘chira oladi");
+    }
+
+    // ⛔️ Faol statuslargina ko‘chadi
+    const movableStatuses = ["pending", "preparing", "ready", "served"];
+    if (!movableStatuses.includes(order.status)) {
+      throw new Error(
+        `Bu statusdagi zakaz ko‘chirib bo‘lmaydi: ${order.status}`
+      );
+    }
+
+    const oldTableId = order.table_id?._id || order.table_id;
+    if (String(oldTableId) === String(newTableId)) {
+      throw new Error("Zakaz allaqachon shu stolda");
+    }
+
+    // 🔎 Yangi stolni tekshirish
+    const newTable = await Table.findById(newTableId).session(session);
+    if (!newTable) throw new Error("Yangi stol topilmadi");
+
+    // 🧮 Yangi stol bandmi? (faol zakazlar bor-yo‘qligi)
+    const activeOnNew = await Order.countDocuments({
+      table_id: newTableId,
+      status: { $in: movableStatuses },
+    }).session(session);
+
+    if (activeOnNew > 0 && !force) {
+      await session.abortTransaction();
+      await session.endSession();
+      return res.status(409).json({
+        success: false,
+        message:
+          "Yangi stol hozir band. Agar baribir ko‘chirmoqchi bo‘lsangiz, 'force=true' yuboring.",
+        hint: {
+          body_example: { orderId, newTableId, force: true },
+        },
+      });
+    }
+
+    // ♻️ Zakazni yangi stolga ko‘chirish
+    order.table_id = newTableId;
+    order.table_number = newTable.number || newTable.name || order.table_number;
+    await order.save({ session });
+
+    // ✅ Transaction yakun
+    await session.commitTransaction();
     await session.endSession();
+
+    // 🔄 Stollar statusini sessiondan tashqarida yangilaymiz
+    // Eski stolni bo‘shatish (agar boshqa faol zakaz qolmagan bo‘lsa)
+    const remainingOnOld = await Order.countDocuments({
+      table_id: oldTableId,
+      status: { $in: movableStatuses },
+    });
+
+    if (remainingOnOld === 0 && oldTableId) {
+      await updateTableStatus(oldTableId, "bo'sh");
+    }
+
+    // Yangi stolni band qilish
+    await updateTableStatus(newTableId, "band");
+
+    // 📡 Socket hodisa
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("order_table_moved", {
+        orderId: order._id,
+        from_table: {
+          id: oldTableId,
+          name: order.table_id?.name, // eski nom yo‘q, UI o‘zi keshlaydi
+        },
+        to_table: {
+          id: newTableId,
+          name: newTable.name || newTable.number,
+        },
+        moved_by: { id: userId, role: userRole },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Zakaz boshqa stolga ko‘chirildi",
+      order: {
+        id: order._id,
+        status: order.status,
+        table_number: order.table_number,
+      },
+      tables: {
+        old: {
+          id: oldTableId,
+          status: remainingOnOld === 0 ? "bo'sh" : "band",
+        },
+        new: { id: newTableId, status: "band" },
+      },
+    });
+  } catch (error) {
+    try {
+      await session.abortTransaction();
+    } catch (_) {}
+    await session.endSession();
+    return res.status(400).json({
+      success: false,
+      message: "Zakazni ko‘chirishda xatolik",
+      error: error.message,
+    });
   }
 };
 
@@ -1830,4 +1926,5 @@ module.exports = {
   getDailySalesSummary,
   updateTableStatus,
   cancelOrderItem,
+  moveOrderToAnotherTable,
 };
